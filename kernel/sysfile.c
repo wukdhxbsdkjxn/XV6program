@@ -1,0 +1,666 @@
+//
+// File-system system calls.
+// Mostly argument checking, since we don't trust
+// user code, and calls into file.c and fs.c.
+//
+
+#include "types.h"
+#include "riscv.h"
+#include "defs.h"
+#include "param.h"
+#include "stat.h"
+#include "spinlock.h"
+#include "proc.h"
+#include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+#include "fcntl.h"
+
+// Fetch the nth word-sized system call argument as a file descriptor
+// and return both the descriptor and the corresponding struct file.
+static int
+argfd(int n, int *pfd, struct file **pf)
+{
+  int fd;
+  struct file *f;
+
+  if(argint(n, &fd) < 0)
+    return -1;
+  if(fd < 0 || fd >= NOFILE || (f=myproc()->ofile[fd]) == 0)
+    return -1;
+  if(pfd)
+    *pfd = fd;
+  if(pf)
+    *pf = f;
+  return 0;
+}
+
+// Allocate a file descriptor for the given file.
+// Takes over file reference from caller on success.
+static int
+fdalloc(struct file *f)
+{
+  int fd;
+  struct proc *p = myproc();
+
+  for(fd = 0; fd < NOFILE; fd++){
+    if(p->ofile[fd] == 0){
+      p->ofile[fd] = f;
+      return fd;
+    }
+  }
+  return -1;
+}
+
+uint64
+sys_dup(void)
+{
+  struct file *f;
+  int fd;
+
+  if(argfd(0, 0, &f) < 0)
+    return -1;
+  if((fd=fdalloc(f)) < 0)
+    return -1;
+  filedup(f);
+  return fd;
+}
+
+uint64
+sys_read(void)
+{
+  struct file *f;
+  int n;
+  uint64 p;
+
+  if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argaddr(1, &p) < 0)
+    return -1;
+  return fileread(f, p, n);
+}
+
+uint64
+sys_write(void)
+{
+  struct file *f;
+  int n;
+  uint64 p;
+
+  if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argaddr(1, &p) < 0)
+    return -1;
+
+  return filewrite(f, p, n);
+}
+
+uint64
+sys_close(void)
+{
+  int fd;
+  struct file *f;
+
+  if(argfd(0, &fd, &f) < 0)
+    return -1;
+  myproc()->ofile[fd] = 0;
+  fileclose(f);
+  return 0;
+}
+
+uint64
+sys_fstat(void)
+{
+  struct file *f;
+  uint64 st; // user pointer to struct stat
+
+  if(argfd(0, 0, &f) < 0 || argaddr(1, &st) < 0)
+    return -1;
+  return filestat(f, st);
+}
+
+// Create the path new as a link to the same inode as old.
+uint64
+sys_link(void)
+{
+  char name[DIRSIZ], new[MAXPATH], old[MAXPATH];
+  struct inode *dp, *ip;
+
+  if(argstr(0, old, MAXPATH) < 0 || argstr(1, new, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+  if((ip = namei(old)) == 0){
+    end_op();
+    return -1;
+  }
+
+  ilock(ip);
+  if(ip->type == T_DIR){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  ip->nlink++;
+  iupdate(ip);
+  iunlock(ip);
+
+  if((dp = nameiparent(new, name)) == 0)
+    goto bad;
+  ilock(dp);
+  if(dp->dev != ip->dev || dirlink(dp, name, ip->inum) < 0){
+    iunlockput(dp);
+    goto bad;
+  }
+  iunlockput(dp);
+  iput(ip);
+
+  end_op();
+
+  return 0;
+
+bad:
+  ilock(ip);
+  ip->nlink--;
+  iupdate(ip);
+  iunlockput(ip);
+  end_op();
+  return -1;
+}
+
+// Is the directory dp empty except for "." and ".." ?
+static int
+isdirempty(struct inode *dp)
+{
+  int off;
+  struct dirent de;
+
+  for(off=2*sizeof(de); off<dp->size; off+=sizeof(de)){
+    if(readi(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+      panic("isdirempty: readi");
+    if(de.inum != 0)
+      return 0;
+  }
+  return 1;
+}
+
+uint64
+sys_unlink(void)
+{
+  struct inode *ip, *dp;
+  struct dirent de;
+  char name[DIRSIZ], path[MAXPATH];
+  uint off;
+
+  if(argstr(0, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+  if((dp = nameiparent(path, name)) == 0){
+    end_op();
+    return -1;
+  }
+
+  ilock(dp);
+
+  // Cannot unlink "." or "..".
+  if(namecmp(name, ".") == 0 || namecmp(name, "..") == 0)
+    goto bad;
+
+  if((ip = dirlookup(dp, name, &off)) == 0)
+    goto bad;
+  ilock(ip);
+
+  if(ip->nlink < 1)
+    panic("unlink: nlink < 1");
+  if(ip->type == T_DIR && !isdirempty(ip)){
+    iunlockput(ip);
+    goto bad;
+  }
+
+  memset(&de, 0, sizeof(de));
+  if(writei(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+    panic("unlink: writei");
+  if(ip->type == T_DIR){
+    dp->nlink--;
+    iupdate(dp);
+  }
+  iunlockput(dp);
+
+  ip->nlink--;
+  iupdate(ip);
+  iunlockput(ip);
+
+  end_op();
+
+  return 0;
+
+bad:
+  iunlockput(dp);
+  end_op();
+  return -1;
+}
+
+static struct inode*
+create(char *path, short type, short major, short minor)
+{
+  struct inode *ip, *dp;
+  char name[DIRSIZ];
+
+  if((dp = nameiparent(path, name)) == 0)
+    return 0;
+
+  ilock(dp);
+
+  if((ip = dirlookup(dp, name, 0)) != 0){
+    iunlockput(dp);
+    ilock(ip);
+    if(type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
+      return ip;
+    iunlockput(ip);
+    return 0;
+  }
+
+  if((ip = ialloc(dp->dev, type)) == 0)
+    panic("create: ialloc");
+
+  ilock(ip);
+  ip->major = major;
+  ip->minor = minor;
+  ip->nlink = 1;
+  iupdate(ip);
+
+  if(type == T_DIR){  // Create . and .. entries.
+    dp->nlink++;  // for ".."
+    iupdate(dp);
+    // No ip->nlink++ for ".": avoid cyclic ref count.
+    if(dirlink(ip, ".", ip->inum) < 0 || dirlink(ip, "..", dp->inum) < 0)
+      panic("create dots");
+  }
+
+  if(dirlink(dp, name, ip->inum) < 0)
+    panic("create: dirlink");
+
+  iunlockput(dp);
+
+  return ip;
+}
+
+uint64
+sys_open(void)
+{
+  char path[MAXPATH];
+  int fd, omode;
+  struct file *f;
+  struct inode *ip;
+  int n;
+
+  if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
+    return -1;
+
+  begin_op();
+
+  if(omode & O_CREATE){
+    ip = create(path, T_FILE, 0, 0);
+    if(ip == 0){
+      end_op();
+      return -1;
+    }
+  } else {
+    if((ip = namei(path)) == 0){
+      end_op();
+      return -1;
+    }
+    ilock(ip);
+    if(ip->type == T_DIR && omode != O_RDONLY){
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+  }
+
+  if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
+    if(f)
+      fileclose(f);
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  if(ip->type == T_DEVICE){
+    f->type = FD_DEVICE;
+    f->major = ip->major;
+  } else {
+    f->type = FD_INODE;
+    f->off = 0;
+  }
+  f->ip = ip;
+  f->readable = !(omode & O_WRONLY);
+  f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+
+  if((omode & O_TRUNC) && ip->type == T_FILE){
+    itrunc(ip);
+  }
+
+  iunlock(ip);
+  end_op();
+
+  return fd;
+}
+
+uint64
+sys_mkdir(void)
+{
+  char path[MAXPATH];
+  struct inode *ip;
+
+  begin_op();
+  if(argstr(0, path, MAXPATH) < 0 || (ip = create(path, T_DIR, 0, 0)) == 0){
+    end_op();
+    return -1;
+  }
+  iunlockput(ip);
+  end_op();
+  return 0;
+}
+
+uint64
+sys_mknod(void)
+{
+  struct inode *ip;
+  char path[MAXPATH];
+  int major, minor;
+
+  begin_op();
+  if((argstr(0, path, MAXPATH)) < 0 ||
+     argint(1, &major) < 0 ||
+     argint(2, &minor) < 0 ||
+     (ip = create(path, T_DEVICE, major, minor)) == 0){
+    end_op();
+    return -1;
+  }
+  iunlockput(ip);
+  end_op();
+  return 0;
+}
+
+uint64
+sys_chdir(void)
+{
+  char path[MAXPATH];
+  struct inode *ip;
+  struct proc *p = myproc();
+  
+  begin_op();
+  if(argstr(0, path, MAXPATH) < 0 || (ip = namei(path)) == 0){
+    end_op();
+    return -1;
+  }
+  ilock(ip);
+  if(ip->type != T_DIR){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+  iunlock(ip);
+  iput(p->cwd);
+  end_op();
+  p->cwd = ip;
+  return 0;
+}
+
+uint64
+sys_exec(void)
+{
+  char path[MAXPATH], *argv[MAXARG];
+  int i;
+  uint64 uargv, uarg;
+
+  if(argstr(0, path, MAXPATH) < 0 || argaddr(1, &uargv) < 0){
+    return -1;
+  }
+  memset(argv, 0, sizeof(argv));
+  for(i=0;; i++){
+    if(i >= NELEM(argv)){
+      goto bad;
+    }
+    if(fetchaddr(uargv+sizeof(uint64)*i, (uint64*)&uarg) < 0){
+      goto bad;
+    }
+    if(uarg == 0){
+      argv[i] = 0;
+      break;
+    }
+    argv[i] = kalloc();
+    if(argv[i] == 0)
+      goto bad;
+    if(fetchstr(uarg, argv[i], PGSIZE) < 0)
+      goto bad;
+  }
+
+  int ret = exec(path, argv);
+
+  for(i = 0; i < NELEM(argv) && argv[i] != 0; i++)
+    kfree(argv[i]);
+
+  return ret;
+
+ bad:
+  for(i = 0; i < NELEM(argv) && argv[i] != 0; i++)
+    kfree(argv[i]);
+  return -1;
+}
+
+uint64
+sys_pipe(void)
+{
+  uint64 fdarray; // user pointer to array of two integers
+  struct file *rf, *wf;
+  int fd0, fd1;
+  struct proc *p = myproc();
+
+  if(argaddr(0, &fdarray) < 0)
+    return -1;
+  if(pipealloc(&rf, &wf) < 0)
+    return -1;
+  fd0 = -1;
+  if((fd0 = fdalloc(rf)) < 0 || (fd1 = fdalloc(wf)) < 0){
+    if(fd0 >= 0)
+      p->ofile[fd0] = 0;
+    fileclose(rf);
+    fileclose(wf);
+    return -1;
+  }
+  if(copyout(p->pagetable, fdarray, (char*)&fd0, sizeof(fd0)) < 0 ||
+     copyout(p->pagetable, fdarray+sizeof(fd0), (char *)&fd1, sizeof(fd1)) < 0){
+    p->ofile[fd0] = 0;
+    p->ofile[fd1] = 0;
+    fileclose(rf);
+    fileclose(wf);
+    return -1;
+  }
+  return 0;
+}
+//add
+int filewrite_offset(struct file *f, uint64 addr, int n, int offset)
+{
+    int r, ret = 0;
+    // 检查文件是否可写，如果不可写则直接返回-1表示失败
+    if(f->writable == 0)
+        return -1;
+    // 检查文件类型是否为FD_INODE，如果不是，则触发panic异常
+    if(f->type != FD_INODE) {
+        panic("filewrite: only FINODE implemented!");
+    }
+    // 计算每次写入的最大字节数
+    //操作块的最大数量-（操作系统占用的2个块和1个额外缓冲区的占用）
+    int max = ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE;
+    int i = 0;
+    // 循环写入数据
+    while(i < n) {
+        int n1 = n - i;
+        if(n1 > max)
+            n1 = max;
+        // 开始文件系统操作
+        begin_op();
+        // 锁定inode
+        ilock(f->ip);
+       // 调用writei函数写入数据，并更新offset
+        if ((r = writei(f->ip, 1, addr + i, offset, n1)) > 0)
+            offset += r;
+        // 解锁inode
+        iunlock(f->ip);
+        // 结束文件系统操作
+        end_op();
+        // 如果写入的字节数与期望的不一致，跳出循环
+        if(r != n1) {
+            break;
+        }
+        // 更新已写入的字节数
+        i += r;
+    }
+    // 根据实际写入的字节数判断写入是否成功，并返回结果
+    ret = (i == n ? n : -1);
+    return ret;
+}
+uint64 sys_mmap (void){
+  // uint64 addr; // 都为 0
+    int length, prot, flags, fd;
+    // int offset; // 都为 0
+    struct file* f;
+
+    // 获取参数
+    if(argint(1, &length) < 0 || argint(2, &prot) < 0
+       || argint(3, &flags) < 0 || argfd(4, &fd, &f) < 0 ) {
+        return -1;
+    }
+
+    // 如果把只读区域映射为可写的而且是 MAP_SHARED 则直接报错
+    // MAP_PRIVATE 不会写
+    // 有 read-only 测试
+    if(!f->writable && (prot & PROT_WRITE) && (flags & MAP_SHARED))
+        return -1;
+
+    // 找到空闲区域, 找到空闲 VMA
+    struct proc* p = myproc();
+    for(int i = 0; i < MAXVMA; ++i) {
+        struct VMA* v = &(p->vma[i]);
+        if(v->length == 0) {
+            v->length = length;
+            v->start = p->sz;
+            v->prot = prot;
+            v->flags = flags;
+            v->offset = 0;
+            v->file = filedup(f); // 引用计数+1
+            // 地址必须是页对齐的
+            length = PGROUNDUP(length);
+            p->sz += length;
+            v->end = p->sz;
+            return v->start;
+        }
+    }
+    return -1;
+}
+
+uint64 sys_munmap(void)
+{
+    uint64 addr; // 存储要解除映射的起始地址
+    int length;  // 存储要解除映射的长度
+    // 获取参数
+    if (argaddr(0, &addr) < 0 || argint(1, &length) < 0)
+        return -1;
+    struct proc *p = myproc(); // 获取当前进程的指针
+    for (int i = 0; i < MAXVMA; ++i)
+    {
+        struct VMA *v = &(p->vma[i]);
+        // 检查当前VMA是否有效
+        if (v->length != 0 && addr < v->end && addr >= v->start)
+        {
+            int should_close = 0; // 标记是否需要关闭文件
+            int offset = v->offset;
+            addr = PGROUNDDOWN(addr);
+            length = PGROUNDUP(length);
+            // 是否从 start 开始
+            if (addr == v->start)
+            {
+              // 是否释放整个文件
+              if (length == v->length)
+              {
+                v->length = 0;
+                // 表示需要关闭与VMA相关联的文件。但不能在这个时候释放, 得在写回之后
+                should_close = 1;
+              }
+              else
+              { // 如果不是释放整个文件
+                v->start += length;
+                v->length -= length;
+                v->offset += length;
+              }
+            }
+            else
+            { // 解除映射的起始地址与VMA的起始地址不相同
+              // 根据要求这个时候只能是释放到结尾
+              v->length -= length;
+            }
+            // 处理 MAP_SHARED
+            if (v->flags & MAP_SHARED)
+            {
+              // 在给定的文件中将指定地址范围的数据写入到偏移量为offset的位置
+              filewrite_offset(v->file, addr, length, offset);
+            }
+            // 解除映射
+            uvmunmap(p->pagetable, addr, length / PGSIZE, 1);
+            if (should_close)
+              fileclose(v->file);
+        }
+    }
+    return 0;
+}
+
+int map_mmap(struct proc *p, uint64 addr)
+{
+  // 遍历 vma 数组，找到具体的文件
+  for (int i = 0; i < MAXVMA; ++i)
+  {
+    struct VMA *v = &(p->vma[i]);
+    // 检查当前VMA是否有效，并且给定地址addr位于VMA的范围内。范围是左闭右开的。
+    if (v->length != 0 && addr < v->end && addr >= v->start)
+    {
+      uint64 start = PGROUNDDOWN(addr);//获取页面的起始地址
+      // 可能释放了一部分, 但是后面部分没有建立映射(offset)
+      //等于从VMA的起始地址开始的偏移量加上VMA的偏移量。这个偏移量用于指定从文件中读取数据的位置。
+      uint64 offset = start - v->start + v->offset;
+
+      // 申请一块空间
+      char *mem = kalloc();
+      if (!mem)
+      {
+        return 0;
+      }
+      memset(mem, 0, PGSIZE);
+
+      // PROT_NONE       0x0   PTE_V (1L << 0)
+      // PROT_READ       0x1   PTE_R (1L << 1)
+      // PROT_WRITE      0x2   PTE_W (1L << 2)
+      // PROT_EXEC       0x4   PTE_X (1L << 3)
+      //                       PTE_U (1L << 4)
+      // 建立映射关系,它会更新进程p的页表，将指定地址范围映射到刚刚分配的内存空间，并设置相关的权限标志
+      if (mappages(p->pagetable, start, PGSIZE,
+                   (uint64)mem, (v->prot << 1) | PTE_U) != 0)
+      {
+        kfree(mem);
+        return 0;
+      }
+
+      // 读取文件
+      ilock(v->file->ip);
+      readi(v->file->ip, 1, start, offset, PGSIZE);//读取数据，写入刚才分配的内存空间中。1表示虚拟地址。
+      iunlock(v->file->ip);
+      return 1;
+    }
+  }
+  return 0;
+}
